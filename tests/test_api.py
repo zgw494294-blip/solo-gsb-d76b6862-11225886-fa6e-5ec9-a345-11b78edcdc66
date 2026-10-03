@@ -532,3 +532,192 @@ def test_split_then_merge_and_merge_then_split():
     assert by["c1"] == "甲方在七日内交付设备；"
     # 后段中指向被拆条款（前段）的引用保持绑定
     assert by["c6"] == "乙方按 [[c1]] 验收后付款"
+
+
+# --------------------------------------------------------------------------- #
+# 原稿对照 /api/diff
+# --------------------------------------------------------------------------- #
+def _doc(text=GOOD):
+    d = import_text(text).json()
+    return d["clauses"]
+
+
+def _diff(base_order, base_clauses, cur_order, cur_clauses):
+    return client.post(
+        "/api/diff",
+        json={
+            "baseline": {"order_ids": base_order, "clauses": base_clauses},
+            "current": {"order_ids": cur_order, "clauses": cur_clauses},
+        },
+    )
+
+
+def _by(items):
+    return {it["id"]: it for it in items}
+
+
+def test_diff_no_changes_on_identical_doc():
+    clauses = _doc()
+    r = _diff(ids4(), _bodies({"clauses": clauses}), ids4(), _bodies({"clauses": clauses}))
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["changed"] is False
+    assert data["items"] == []
+    assert data["broken_refs"] == []
+
+
+def test_diff_number_shift_after_deletion_is_not_change():
+    # 删除造成的编号平移：其余仍存条款相对先后未颠倒，不算移动；
+    # 正文绑定不变，显示编号变化不算改动，引用仍有效
+    bodies = _bodies({"clauses": _doc("1|甲\n2|乙\n3|丙 [[2]]")})
+    order = ["c1", "c2", "c3"]
+    # 删除中间的 c2：c3 中对 c2 的引用随删除失效（由 broken_refs 另列），
+    # 但 c3 正文内部串未变、且与 c1 相对顺序未颠倒 → 不记 changed/moved
+    cur_bodies = [b for b in bodies if b["id"] != "c2"]
+    data = _diff(order, bodies, ["c1", "c3"], cur_bodies).json()
+    assert [it["id"] for it in data["items"]] == ["c2"]
+    assert data["items"][0]["tags"] == ["deleted"]
+    # c3 与 c1 相对先后不变：无 moved
+    assert all("moved" not in it["tags"] for it in data["items"])
+    # 失效引用另列
+    assert [b["source_id"] for b in data["broken_refs"]] == ["c3"]
+
+
+def test_diff_move_marks_inverted_survivors_only():
+    bodies = _bodies({"clauses": _doc()})
+    # c4 提到 c1 之前：c4 与 c1 相对颠倒；c2、c3 相对其他条款颠倒于 c4 但 c4 也移动
+    order = ["c4", "c1", "c2", "c3"]
+    data = _diff(ids4(), bodies, order, bodies).json()
+    tags = {it["id"]: it["tags"] for it in data["items"]}
+    # c4 越过 c1,c2,c3 → moved；c1/c2/c3 与 c4 相对颠倒 → 同样 moved
+    assert tags["c4"] == ["moved"]
+    assert tags["c1"] == ["moved"]
+    assert tags["c2"] == ["moved"]
+    assert tags["c3"] == ["moved"]
+    # 现存项按当前顺序
+    assert [it["id"] for it in data["items"]] == ["c4", "c1", "c2", "c3"]
+    # 现编号按当前顺序，两版正文按各自编号体系解析（[[c?]] 绑定相同 → 编号不同）
+    c1 = _by(data["items"])["c1"]
+    assert c1["old_no"] == 1 and c1["new_no"] == 2
+    c3 = _by(data["items"])["c3"]
+    assert c3["old_text"] == "争议解决见 [[4]]，违约参照 [[2]]"
+    assert c3["new_text"] == "争议解决见 [[1]]，违约参照 [[3]]"
+
+
+def test_diff_deleted_items_appended_in_baseline_order():
+    bodies = _bodies({"clauses": _doc()})
+    order = ["c4", "c2"]  # 现存条款也颠倒了顺序（c4 越过 c2）
+    cur_bodies = [b for b in bodies if b["id"] in ("c2", "c4")]
+    data = _diff(ids4(), bodies, order, cur_bodies).json()
+    ids = [it["id"] for it in data["items"]]
+    # 现存项（c4、c2 相对颠倒）按当前顺序，删除项随后按基线顺序（c1 在 c3 前）
+    assert ids == ["c4", "c2", "c1", "c3"]
+    assert _by(data["items"])["c1"]["tags"] == ["deleted"]
+    assert _by(data["items"])["c4"]["tags"] == ["moved"]
+    assert _by(data["items"])["c2"]["tags"] == ["moved"]
+
+
+def test_diff_edit_body_changed_and_number_change_alone_not():
+    d = import_text(GOOD).json()
+    bodies = _bodies(d)
+    # 编辑 c2 正文（引用改绑 c4，且在原顺序下编辑）
+    r = client.post(
+        "/api/save",
+        json={"order_ids": ids4(), "clauses": bodies, "edit_id": "c2",
+              "text": "改为引用当前第 1 条 [[1]]"},
+    )
+    new_body = r.json()["body"]
+    cur_bodies = [b if b["id"] != "c2" else {"id": "c2", "body": new_body} for b in bodies]
+    data = _diff(ids4(), bodies, ids4(), cur_bodies).json()
+    assert len(data["items"]) == 1
+    it = data["items"][0]
+    assert it["id"] == "c2" and it["tags"] == ["changed"]
+    assert it["old_text"] == "乙方按 [[1]] 验收后付款"
+    assert it["new_text"] == "改为引用当前第 1 条 [[1]]"
+
+
+def test_diff_body_unchanged_but_ref_broken_listed_separately():
+    bodies = _bodies({"clauses": _doc()})
+    # 删除 c4：c3 正文内部串未变（仍是 [[c4]]），但引用由有效变失效
+    order = ["c1", "c2", "c3"]
+    cur_bodies = [b for b in bodies if b["id"] != "c4"]
+    data = _diff(ids4(), bodies, order, cur_bodies).json()
+    # c3 不在 items（无 added/deleted/changed/moved 标签）
+    assert {it["id"] for it in data["items"]} == {"c4"}
+    assert len(data["broken_refs"]) == 1
+    br = data["broken_refs"][0]
+    assert br["source_id"] == "c3"
+    assert br["source_display"] == 3
+    assert br["ref_id"] == "c4" and br["ref_original"] == 4
+    assert br["marker"] == "[[原4?]]"
+    # 偏移指向解析后正文中的失效标记起点
+    assert br["offset"] == len("争议解决见 ")
+    assert data["changed"] is True
+
+
+def test_diff_merge_records_keep_changed_and_drop_deleted():
+    bodies = _bodies({"clauses": _doc()})
+    r = client.post(
+        "/api/merge",
+        json={"order_ids": ids4(), "clauses": bodies, "keep_id": "c1", "drop_id": "c2"},
+    )
+    data1 = r.json()
+    data = _diff(ids4(), bodies, data1["order_ids"], data1["clauses"]).json()
+    by = {it["id"]: it for it in data["items"]}
+    # c1 合并后正文改变 → changed；c2 删除 → deleted；c3 引用改指 c1 → changed
+    assert "changed" in by["c1"]["tags"]
+    assert by["c2"]["tags"] == ["deleted"]
+    assert "changed" in by["c3"]["tags"]
+    # 删除项排在最后
+    assert data["items"][-1]["id"] == "c2"
+
+
+def test_diff_split_records_front_changed_and_back_added():
+    bodies = _bodies({"clauses": _doc()})
+    r = _split(ids4(), bodies, "c2", 2, "c5", refs_to="front")
+    data1 = r.json()
+    data = _diff(ids4(), bodies, data1["order_ids"], data1["clauses"]).json()
+    by = {it["id"]: it for it in data["items"]}
+    assert by["c2"]["tags"] == ["changed"]
+    assert by["c5"]["tags"] == ["added"]
+    assert by["c5"]["old_no"] is None and by["c5"]["old_text"] is None
+    assert by["c5"]["new_no"] == 3
+    # 新段插入造成的编号平移：c3/c4 不算 moved
+    assert "c3" not in by and "c4" not in by
+    # 现存项顺序里新增段紧随 c2；无删除项
+    assert [it["id"] for it in data["items"]] == ["c2", "c5"]
+
+
+def test_diff_split_back_repointing_others_changed():
+    bodies = _bodies({"clauses": _doc()})
+    r = _split(ids4(), bodies, "c2", 2, "c5", refs_to="back")
+    data1 = r.json()
+    data = _diff(ids4(), bodies, data1["order_ids"], data1["clauses"]).json()
+    by = {it["id"]: it for it in data["items"]}
+    # c3 中指向 c2 的引用改指 c5 → 内部串变化 → changed（不是仅编号变化）
+    assert "changed" in by["c3"]["tags"]
+
+
+def test_diff_tags_coexist_changed_and_moved():
+    bodies = _bodies({"clauses": _doc()})
+    # 先编辑 c2，再把 c2 移到 c1 之前并与其它条款颠倒
+    saved = [
+        b if b["id"] != "c2" else {"id": "c2", "body": "新的正文内容"} for b in bodies
+    ]
+    order = ["c2", "c1", "c3", "c4"]
+    data = _diff(ids4(), bodies, order, saved).json()
+    by = {it["id"]: it for it in data["items"]}
+    assert set(by["c2"]["tags"]) == {"changed", "moved"}
+    assert by["c1"]["tags"] == ["moved"]  # 与 c2 颠倒
+
+
+def test_diff_validates_both_states():
+    bodies = _bodies({"clauses": _doc()})
+    # 当前草稿顺序与条款集合不一致 → 422
+    r = _diff(ids4(), bodies, ["c1"], bodies)
+    assert r.status_code == 422
+    # 基线内部引用形态损坏 → 422
+    bad = [dict(b) for b in bodies]
+    bad[0] = {"id": "c1", "body": "损坏引用 [[1]]"}
+    r = _diff(ids4(), bad, ids4(), bodies)
+    assert r.status_code == 422

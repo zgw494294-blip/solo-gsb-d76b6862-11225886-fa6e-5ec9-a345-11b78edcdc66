@@ -21,11 +21,20 @@ const state = {
   epoch: 0, // 草稿世代：导入成功 / 重新导入时 +1；上一草稿的迟到响应一律丢弃
   rev: 0, // 草稿修订号：任何本地改动 +1；响应发出后草稿又有改动的，响应不再适用
   previewFresh: false, // 页面预览是否已追上最新草稿；未追上时禁止下载与合并
+  baseline: null, // 成功导入时建立的不可变原稿基线 { order_ids, clauses: [{id, body}] }
   importing: false, // /api/import 在途（期间忽略重复提交）
   saving: false, // /api/save 在途
   merging: false, // /api/merge 在途（期间阻止编辑 / 删除 / 重排 / 勾选 / 重复合并）
   splitting: false, // /api/split 在途（期间阻止其他改稿）
   exporting: false, // /api/export 在途
+  // 原稿对照面板
+  diffOpen: false, // 面板是否展开
+  diffLoading: false, // /api/diff 在途
+  diffError: null, // 最近一次对照失败的错误信息（数组）
+  diffResult: null, // 最近一次成功对照结果（仅当 diffFresh 时与当前草稿对应）
+  diffRev: null, // 结果对应的草稿修订号；与 state.rev 不同即表示改稿后已过期
+  diffEpoch: null, // 结果对应的草稿世代；重新导入后旧结果作废
+  diffFresh: false, // 对照结果是否仍与当前草稿一致（改稿后立即变 false）
 };
 
 const MAX_CLAUSES = 40; // 与后端 MAX_LINES 一致：拆分后总数不能超过它
@@ -33,6 +42,7 @@ const MAX_CLAUSES = 40; // 与后端 MAX_LINES 一致：拆分后总数不能超
 let previewSeq = 0; // 预览请求序号：只采用最后一次发出的预览响应
 let exportSeq = 0; // 下载请求序号：只有仍持有它的下载能收尾按钮；重新导入 / 新下载会作废旧下载的收尾权
 let previewInFlight = false; // 是否已有 /api/preview 在途：防止重试预览重复提交
+let diffSeq = 0; // 对照请求序号：只采用最后一次、且仍对应当前草稿的响应
 
 const MARKER = /\[\[(?:原(\d+)\?|(\d+))\]\]/g; // 预览文本中的引用形态
 
@@ -51,6 +61,14 @@ const downloadBtn = $("#download-btn");
 const mergeBtn = $("#merge-btn");
 const statCount = $("#stat-count");
 const statBroken = $("#stat-broken");
+const diffBtn = $("#diff-btn");
+const diffPanel = $("#diff-panel");
+const diffStatus = $("#diff-status");
+const diffRefreshBtn = $("#diff-refresh-btn");
+const diffCloseBtn = $("#diff-close-btn");
+const diffList = $("#diff-list");
+const diffEmpty = $("#diff-empty");
+const diffBroken = $("#diff-broken");
 
 // --------------------------------------------------------------------------- //
 // 工具
@@ -113,10 +131,13 @@ function snapshot() {
 // --------------------------------------------------------------------------- //
 // 任何本地草稿改动都要经过 touch()：修订号 +1（使在途响应失效）、
 // 标记预览未追上最新草稿（期间禁止下载 / 合并），直到下一次预览响应被采用。
+// 改稿后旧对照立即失效（不删除已展示结果，但标记过期、禁止迟到响应覆盖新结果）。
 function touch() {
   state.rev += 1;
   state.previewFresh = false;
+  state.diffFresh = false;
   syncToolbar();
+  if (state.diffOpen) renderDiff();
 }
 
 function syncToolbar() {
@@ -239,6 +260,21 @@ importBtn.addEventListener("click", async () => {
     state.splitRefsTo = "front";
     state.splitting = false;
     state.idCounter = data.clauses.length; // 导入身份为 c1..cN，拆分新身份从 N+1 起
+    // 成功导入：建立不可变原稿基线（深拷贝，之后任何改稿都不会回写它）
+    state.baseline = {
+      order_ids: data.clauses.map((c) => c.id),
+      clauses: data.clauses.map((c) => ({ id: c.id, body: c.body })),
+    };
+    // 重新建立基线：旧对照结果、过期标记与在途请求全部作废
+    state.diffOpen = false;
+    state.diffLoading = false;
+    state.diffError = null;
+    state.diffResult = null;
+    state.diffRev = null;
+    state.diffEpoch = null;
+    state.diffFresh = false;
+    diffSeq += 1;
+    diffPanel.hidden = true;
     state.preview = null;
     state.previewError = null;
     state.renderedRev = null;
@@ -274,6 +310,17 @@ $("#reimport-btn").addEventListener("click", () => {
   state.splitOffset = null;
   state.splitRefsTo = "front";
   state.idCounter = 0;
+  // 重新导入：清空基线与对照，成功导入后才重新建立
+  state.baseline = null;
+  state.diffOpen = false;
+  state.diffLoading = false;
+  state.diffError = null;
+  state.diffResult = null;
+  state.diffRev = null;
+  state.diffEpoch = null;
+  state.diffFresh = false;
+  diffSeq += 1; // 上一草稿在途的对照响应一律作废
+  diffPanel.hidden = true;
   state.preview = null;
   state.previewError = null;
   state.renderedRev = null;
@@ -1015,6 +1062,170 @@ function moveClause(srcId, targetId, after) {
   touch();
   render();
 }
+
+// --------------------------------------------------------------------------- //
+// 原稿对照（基线不可变；对照只按当前“已保存草稿”，与预览刷新成败无关）
+// --------------------------------------------------------------------------- //
+const DIFF_TAG_LABEL = {
+  added: "新增",
+  deleted: "删除",
+  changed: "正文改动",
+  moved: "移动",
+};
+
+// 对照面板里的正文：[[n]] 显示为编号标记（不可点击跳转，仅作展示），
+// [[原X?]] 显示为红色失效标记
+function diffBodyHtml(text) {
+  let html = "";
+  let last = 0;
+  for (const m of String(text).matchAll(MARKER)) {
+    html += esc(text.slice(last, m.index));
+    if (m[1] !== undefined) {
+      html += `<span class="ref dead">[[原${m[1]}?]]</span>`;
+    } else {
+      html += `<span class="ref">[[${m[2]}]]</span>`;
+    }
+    last = m.index + m[0].length;
+  }
+  html += esc(text.slice(last));
+  return html;
+}
+
+function diffRow(label, text, cls) {
+  if (text === null || text === undefined) {
+    return `<div class="diff-text ${cls}"><span class="diff-side">${label}</span><span class="diff-none">（无）</span></div>`;
+  }
+  return `<div class="diff-text ${cls}"><span class="diff-side">${label}</span><span class="diff-content">${diffBodyHtml(text)}</span></div>`;
+}
+
+// 纯 DOM 渲染：不改任何状态。loading / error / stale / fresh 分别展示；
+// 改稿后旧结果继续可见但标“已过期”，直到下一次成功对照返回。
+function renderDiff() {
+  const hasResult = state.diffResult !== null;
+
+  // 顶部状态与按钮
+  diffRefreshBtn.disabled = state.diffLoading || !state.baseline;
+  diffRefreshBtn.textContent = state.diffLoading ? "对照中…" : "重新对照";
+  if (state.diffLoading) {
+    diffStatus.textContent = "正在对照当前草稿…";
+  } else if (state.diffError) {
+    diffStatus.textContent = "对照失败，草稿与基线均未改动，可重试。";
+  } else if (!hasResult) {
+    diffStatus.textContent = "";
+  } else if (!state.diffFresh) {
+    diffStatus.textContent = "草稿已改动：以下为改稿前的旧对照，点「重新对照」获取最新结果。";
+  } else {
+    diffStatus.textContent = "已按当前草稿对照（基线为成功导入时的原稿）。";
+  }
+  diffStatus.classList.toggle("stale", hasResult && !state.diffFresh && !state.diffLoading);
+
+  // 错误条
+  let errorHtml = "";
+  if (state.diffError) {
+    errorHtml =
+      `<ul class="diff-error">${state.diffError.map((m) => `<li>${esc(m)}</li>`).join("")}</ul>`;
+  }
+
+  // 失效引用（正文未变但引用由有效变失效）：另列来源及位置
+  let brokenHtml = "";
+  const refs = hasResult ? state.diffResult.broken_refs : [];
+  if (refs.length) {
+    const lines = refs.map((b) => {
+      const loc = `第 ${b.source_display} 条（原第 ${b.source_original} 条）正文第 ${b.offset + 1} 个字符处`;
+      return `<li>${esc(loc)}：${esc(b.marker)} 引用的原第 ${b.ref_original} 条已删除（正文未改动）</li>`;
+    });
+    brokenHtml =
+      `<li class="diff-broken-title">正文未变但引用由有效变失效：</li>` + lines.join("");
+  }
+  diffBroken.innerHTML = brokenHtml;
+  diffBroken.hidden = !refs.length;
+
+  // 条目
+  const items = hasResult ? state.diffResult.items : [];
+  if (!hasResult) {
+    diffList.innerHTML = errorHtml
+      ? `<li class="diff-error-wrap">${errorHtml}</li>`
+      : "";
+    diffEmpty.hidden = true;
+    if (!errorHtml && !state.diffLoading) {
+      diffList.innerHTML = '<li class="diff-none-hint">点上方「重新对照」，按当前已保存草稿与原稿基线对照。</li>';
+    }
+    return;
+  }
+
+  const rows = items
+    .map((it) => {
+      const chips = it.tags.map((t) => `<span class="diff-tag tag-${t}">${DIFF_TAG_LABEL[t] || esc(t)}</span>`).join("");
+      const head =
+        `<div class="diff-item-head">${chips}` +
+        `<span class="diff-nos">原编号 <b>${it.old_no === null ? "—" : it.old_no}</b>` +
+        ` → 现编号 <b>${it.new_no === null ? "—" : it.new_no}</b>` +
+        ` <span class="muted">（稳定身份 ${esc(it.id)}）</span></span></div>`;
+      return `<li class="diff-item tag-side-${it.tags[0]}">${head}` +
+        diffRow("原稿", it.old_text, "old") +
+        diffRow("现稿", it.new_text, "new") +
+        "</li>";
+    })
+    .join("");
+  diffList.innerHTML = errorHtml + rows;
+  diffEmpty.hidden = items.length > 0 || refs.length > 0;
+}
+
+async function refreshDiff() {
+  if (!state.baseline || state.diffLoading) return;
+  const seq = ++diffSeq;
+  const epoch = state.epoch;
+  const rev = state.rev;
+  state.diffLoading = true;
+  state.diffError = null;
+  renderDiff();
+  try {
+    const data = await api("/api/diff", {
+      baseline: state.baseline,
+      current: snapshot(),
+    });
+    // 迟到响应（已重新导入 / 又发起更新的对照 / 草稿已变化）不得覆盖新结果：
+    // 只采用最后一次、且仍对应当前草稿世代与修订号的响应
+    if (seq !== diffSeq || epoch !== state.epoch) return;
+    if (rev !== state.rev) return; // 等待期间又改了稿：结果按旧草稿，不得覆盖为“已最新”
+    state.diffResult = data;
+    state.diffEpoch = epoch;
+    state.diffRev = rev;
+    state.diffFresh = true;
+  } catch (e) {
+    if (seq !== diffSeq || epoch !== state.epoch) return; // 不属于当前对照：不提示
+    // 对照失败：不改变已有对照，也不回退草稿；展示错误，可重试
+    state.diffError = errorList(e);
+  } finally {
+    if (seq === diffSeq && epoch === state.epoch) {
+      state.diffLoading = false;
+      renderDiff();
+    }
+  }
+}
+
+diffBtn.addEventListener("click", () => {
+  if (!state.baseline) return;
+  state.diffOpen = !state.diffOpen;
+  diffPanel.hidden = !state.diffOpen;
+  if (state.diffOpen) {
+    renderDiff();
+    // 尚无结果，或结果已因改稿过期：自动发起对照；
+    // 预览刷新失败时仍按已提交草稿对照（不依赖 /api/preview）
+    if (!state.diffLoading && (state.diffResult === null || !state.diffFresh)) {
+      refreshDiff();
+    }
+  }
+});
+
+diffCloseBtn.addEventListener("click", () => {
+  state.diffOpen = false;
+  diffPanel.hidden = true;
+});
+
+diffRefreshBtn.addEventListener("click", () => {
+  refreshDiff();
+});
 
 // --------------------------------------------------------------------------- //
 // 下载（以服务端 /api/export 为准，保证与预览一致）

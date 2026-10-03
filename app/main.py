@@ -15,6 +15,19 @@
   本草稿从未用过的全新 id（被删除或合并移除的 id 不复用，已有失效引用不会因此复活）；
   指向被拆条款的全部引用（含两段中的自引用）按请求统一改指前段或后段，其余引用不动；
   新条款在顺序表中紧跟前段，其余条款相对顺序不变。
+
+原稿对照（``POST /api/diff``）：
+- 基线与当前草稿都沿用现有草稿结构（``order_ids`` + 内部形态条款），服务端无状态、
+  不落盘、不回退任何草稿。
+- 按稳定 id 比对：两版都有且内部正文不同记“正文改动”（合并的保留身份、拆分的前段
+  都据此记改动）；仅当前有的记“新增”（拆分后段）；仅基线有的记“删除”（合并的
+  另一身份）。正文按内部引用绑定比较，纯重排造成的显示编号变化不算改动。
+- “移动”只标记在两版都存在的条款中、与另一条仍存条款相对先后颠倒的条款；
+  删除条款或拆分插入新段造成的编号平移不算移动。
+- 正文未变但内部引用由有效变失效（目标条款已删除）时，不计正文改动，
+  另列引用来源条款与位置（码位偏移、失效标记）。
+- 结果中现存条款按当前顺序排列，删除项随后按基线原顺序排列；每项给出原编号、
+  现编号及两版各自编号体系下解析出的正文。
 """
 
 from __future__ import annotations
@@ -80,6 +93,12 @@ class SplitIn(BaseModel):
     offset: int  # 分界：已保存正文中的字符位置（按 Unicode 码位计）
     new_id: str  # 后段的新身份（本草稿从未使用过的 id）
     refs_to: str  # 原指向被拆条款的引用落到 "front"（前段）还是 "back"（后段）
+
+
+class DiffIn(BaseModel):
+    # 基线（成功导入时的不可变原稿）与当前草稿，均沿用现有草稿结构
+    baseline: StateIn
+    current: StateIn
 
 
 # --------------------------------------------------------------------------- #
@@ -455,6 +474,116 @@ def export_doc(payload: StateIn):
             detail={"errors": ["存在失效引用，修复前禁止下载", *sources]},
         )
     return {"text": "\n".join(lines)}
+
+
+@app.post("/api/diff")
+def diff_doc(payload: DiffIn):
+    """按稳定身份对照不可变基线（原稿）与当前已保存草稿。
+
+    - 两版都有且内部正文不同 → ``changed``（合并保留身份、拆分前段均可能命中）；
+      仅当前有 → ``added``（拆分后段）；仅基线有 → ``deleted``（合并的另一身份）。
+    - ``moved`` 只标记两版都存在的条款中，与另一条仍存条款相对先后颠倒者；
+      删除条款、拆分插入新段造成的编号平移不算移动。标签可并存。
+    - 正文按内部引用绑定比较：纯重排仅令显示编号变化，内部串相同，不算改动；
+      引用由有效变失效（目标已删除）时内部串仍相同，不计改动，
+      转由 ``broken_refs`` 另列来源条款与位置。
+    - 现存项按当前顺序排列，删除项随后按基线原顺序排列；无任何变化时返回空列表。
+    """
+    base, cur = payload.baseline, payload.current
+    base_by = _validate_state(base.order_ids, base.clauses)
+    cur_by = _validate_state(cur.order_ids, cur.clauses)
+
+    base_pos = {cid: i for i, cid in enumerate(base.order_ids)}
+    cur_pos = {cid: i for i, cid in enumerate(cur.order_ids)}
+    base_ids, cur_ids = set(base.order_ids), set(cur.order_ids)
+    survivors = base_ids & cur_ids
+
+    # 移动：两版都存在的条款两两比较相对先后，任一对颠倒（无论越过方向）即标记；
+    # 删除 / 拆分插入造成的纯编号平移不在 survivor 对中体现，天然不算
+    moved: set[str] = set()
+    for cid in survivors:
+        for other in survivors:
+            if other == cid:
+                continue
+            if (base_pos[cid] < base_pos[other]) != (cur_pos[cid] < cur_pos[other]):
+                moved.add(cid)
+                break
+
+    base_display = {cid: i + 1 for i, cid in enumerate(base.order_ids)}
+    cur_display = {cid: i + 1 for i, cid in enumerate(cur.order_ids)}
+
+    def resolved(order_ids, by_id, display_map):
+        out = {}
+        for cid in order_ids:
+            text, _broken = resolve_body(by_id[cid].body, display_map)
+            out[cid] = text
+        return out
+
+    base_text = resolved(base.order_ids, base_by, base_display)
+    cur_text = resolved(cur.order_ids, cur_by, cur_display)
+
+    items: list[dict] = []
+    # 现存项（新增 / 正文改动 / 移动）按当前顺序；无变化的条款不列出
+    for cid in cur.order_ids:
+        tags: list[str] = []
+        if cid not in base_by:
+            tags.append("added")
+        else:
+            if cur_by[cid].body != base_by[cid].body:
+                tags.append("changed")
+            if cid in moved:
+                tags.append("moved")
+        if not tags:
+            continue
+        items.append(
+            {
+                "id": cid,
+                "original": int(cid[1:]),
+                "tags": tags,
+                "old_no": base_display.get(cid),
+                "new_no": cur_display[cid],
+                "old_text": base_text.get(cid),
+                "new_text": cur_text[cid],
+            }
+        )
+    # 删除项随后按基线原顺序
+    for cid in base.order_ids:
+        if cid in cur_by:
+            continue
+        items.append(
+            {
+                "id": cid,
+                "original": int(cid[1:]),
+                "tags": ["deleted"],
+                "old_no": base_display[cid],
+                "new_no": None,
+                "old_text": base_text[cid],
+                "new_text": None,
+            }
+        )
+
+    # 引用由有效变失效：当前草稿中的失效标记，其目标在基线中存在（基线引用原本有效）。
+    # 逐条正文扫描，记录来源条款（当前位置）与失效位置（解析文本中的码位偏移）。
+    broken_refs: list[dict] = []
+    for cid in cur.order_ids:
+        body = cur_by[cid].body
+        for m in MARKER_RE.finditer(body):
+            token = m.group(1)
+            if token not in cur_pos and token in base_pos:
+                original = int(ID_RE.match(token).group(1))
+                prefix, _ = resolve_body(body[: m.start()], cur_display)
+                broken_refs.append(
+                    {
+                        "source_id": cid,
+                        "source_original": int(cid[1:]),
+                        "source_display": cur_display[cid],
+                        "ref_id": token,
+                        "ref_original": original,
+                        "offset": len(prefix),
+                        "marker": f"[[原{original}?]]",
+                    }
+                )
+    return {"changed": bool(items or broken_refs), "items": items, "broken_refs": broken_refs}
 
 
 # --------------------------------------------------------------------------- #
