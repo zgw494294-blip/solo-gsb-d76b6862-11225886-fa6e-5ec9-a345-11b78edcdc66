@@ -15,6 +15,17 @@
   本草稿从未用过的全新 id（被删除或合并移除的 id 不复用，已有失效引用不会因此复活）；
   指向被拆条款的全部引用（含两段中的自引用）按请求统一改指前段或后段，其余引用不动；
   新条款在顺序表中紧跟前段，其余条款相对顺序不变。
+
+原稿对照（``POST /api/diff``）：
+- 入参为两份沿用现有草稿结构的文档：成功导入后不可变的原稿基线（baseline）与
+  当前已保存草稿（current）；接口只返回对照结果，不回退、不修改任何一份草稿。
+- 按稳定 id 识别条款，标注新增（added）、删除（deleted）、正文改动（body_changed）、
+  移动（moved），标签可并存。正文按内部引用绑定比较：仅显示编号变化不算正文改动。
+- 移动只计基线与现稿中都仍存在、且彼此先后颠倒的条款；删除或拆分插入造成的
+  编号平移不算移动。合并记保留身份的正文改动与另一身份删除；拆分记前段正文改动、
+  后段新增。
+- 正文未变但某条引用由基线中的有效引用变成现稿失效引用时，另列引用来源条款与位置。
+- 现存项按当前顺序排列，删除项随后按基线顺序排列；没有任何变化时 has_changes 为假。
 """
 
 from __future__ import annotations
@@ -80,6 +91,12 @@ class SplitIn(BaseModel):
     offset: int  # 分界：已保存正文中的字符位置（按 Unicode 码位计）
     new_id: str  # 后段的新身份（本草稿从未使用过的 id）
     refs_to: str  # 原指向被拆条款的引用落到 "front"（前段）还是 "back"（后段）
+
+
+class DiffIn(BaseModel):
+    # 成功导入后保留的不可变原稿基线；两份文档均沿用现有草稿结构
+    baseline: StateIn
+    current: StateIn
 
 
 # --------------------------------------------------------------------------- #
@@ -455,6 +472,124 @@ def export_doc(payload: StateIn):
             detail={"errors": ["存在失效引用，修复前禁止下载", *sources]},
         )
     return {"text": "\n".join(lines)}
+
+
+# --------------------------------------------------------------------------- #
+# 原稿对照
+# --------------------------------------------------------------------------- #
+def _moved_ids(base_order: list[str], cur_order: list[str]) -> set[str]:
+    """找出发生“移动”的稳定身份。
+
+    只看基线与现稿中都仍存在的身份：某条款若与任一其他共存条款的先后关系
+    相对基线发生颠倒（现稿中在它之前的某条原在其后，或在它之后的某条原在其前），
+    即为移动的参与方。删除 / 拆分插入造成的纯编号平移不改变共存条款的相对先后，
+    不会被标记。
+    """
+    base_rank = {clause_id: i for i, clause_id in enumerate(base_order)}
+    common = [clause_id for clause_id in cur_order if clause_id in base_rank]
+    ranks = [base_rank[clause_id] for clause_id in common]
+    n = len(ranks)
+    moved: set[str] = set()
+    if n < 2:
+        return moved
+    pref_max = [0] * n
+    suff_min = [0] * n
+    pref_max[0] = ranks[0]
+    for i in range(1, n):
+        pref_max[i] = max(pref_max[i - 1], ranks[i])
+    suff_min[-1] = ranks[-1]
+    for i in range(n - 2, -1, -1):
+        suff_min[i] = min(suff_min[i + 1], ranks[i])
+    for i, rank in enumerate(ranks):
+        inverted_before = i > 0 and pref_max[i - 1] > rank
+        inverted_after = i < n - 1 and suff_min[i + 1] < rank
+        if inverted_before or inverted_after:
+            moved.add(common[i])
+    return moved
+
+
+@app.post("/api/diff")
+def diff_doc(payload: DiffIn):
+    """对照不可变原稿基线与当前已保存草稿，只返回对照结果、不回退任何草稿。"""
+    base = payload.baseline
+    cur = payload.current
+    base_by = _validate_state(base.order_ids, base.clauses)
+    cur_by = _validate_state(cur.order_ids, cur.clauses)
+    base_pos = {clause_id: i + 1 for i, clause_id in enumerate(base.order_ids)}
+    cur_pos = {clause_id: i + 1 for i, clause_id in enumerate(cur.order_ids)}
+
+    moved = _moved_ids(base.order_ids, cur.order_ids)
+    base_set = set(base.order_ids)
+
+    def entry(
+        clause_id: str,
+        tags: list[str],
+        base_text: str | None,
+        cur_text: str | None,
+    ) -> dict:
+        return {
+            "id": clause_id,
+            "original": int(clause_id[1:]),
+            "baseline_no": base_pos.get(clause_id),
+            "current_no": cur_pos.get(clause_id),
+            "baseline_text": base_text,
+            "current_text": cur_text,
+            "tags": tags,
+        }
+
+    items: list[dict] = []
+    # 现存项按当前顺序排列
+    for clause_id in cur.order_ids:
+        cur_text, _ = resolve_body(cur_by[clause_id].body, cur_pos)
+        if clause_id not in base_set:
+            items.append(entry(clause_id, ["added"], None, cur_text))
+            continue
+        base_text, _ = resolve_body(base_by[clause_id].body, base_pos)
+        tags: list[str] = []
+        if base_by[clause_id].body != cur_by[clause_id].body:
+            tags.append("body_changed")  # 按内部引用绑定比较；仅显示编号变化不改正文
+        if clause_id in moved:
+            tags.append("moved")
+        if tags:
+            items.append(entry(clause_id, tags, base_text, cur_text))
+
+    # 删除项随后按基线原顺序排列（合并记保留身份改动、另一身份删除）
+    for clause_id in base.order_ids:
+        if clause_id in cur_pos:
+            continue
+        base_text, _ = resolve_body(base_by[clause_id].body, base_pos)
+        items.append(entry(clause_id, ["deleted"], base_text, None))
+
+    # 正文未变、但引用由基线有效变为现稿失效：另列来源条款及位置（1 起，按 Unicode 码位）
+    invalid_refs: list[dict] = []
+    for clause_id in cur.order_ids:
+        if clause_id not in base_set:
+            continue
+        base_body = base_by[clause_id].body
+        cur_body = cur_by[clause_id].body
+        if base_body != cur_body:
+            continue
+        cur_text, _ = resolve_body(cur_body, cur_pos)
+        base_text, _ = resolve_body(base_body, base_pos)
+        for m in MARKER_RE.finditer(cur_body):
+            ref_id = m.group(1)
+            if ref_id in base_pos and ref_id not in cur_pos:
+                invalid_refs.append(
+                    {
+                        "source_id": clause_id,
+                        "source_original": int(clause_id[1:]),
+                        "baseline_no": base_pos[clause_id],
+                        "current_no": cur_pos[clause_id],
+                        "ref_id": ref_id,
+                        "ref_original": int(ID_RE.match(ref_id).group(1)),
+                        "position": m.start() + 1,
+                        "position_end": m.end() + 1,
+                        "baseline_text": base_text,
+                        "current_text": cur_text,
+                    }
+                )
+
+    return {"items": items, "invalid_refs": invalid_refs, "has_changes": bool(items or invalid_refs)}
 
 
 # --------------------------------------------------------------------------- #

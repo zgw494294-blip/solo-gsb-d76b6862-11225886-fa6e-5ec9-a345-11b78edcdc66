@@ -266,3 +266,78 @@ button.danger:hover:not(:disabled) { background: var(--danger-bg); }
   overflow: auto;
 }
 .preview.blocked { background: var(--warn-bg); border-color: #f5d9a8; color: var(--warn); }
+
+/* --------------------------------------------------------------------------- */
+/* 原稿对照 */
+/* --------------------------------------------------------------------------- */
+.diff-panel { border-color: #c9d7f5; background: #fbfcff; }
+.diff-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.diff-head h2 { margin-bottom: 4px; }
+.diff-status { font-size: 12.5px; color: var(--muted); }
+.diff-status.is-fresh { color: var(--ok); }
+.diff-status.is-stale { color: var(--warn); }
+
+/* 改稿后旧对照立即失效：旧内容置灰展示，直到新草稿的对照响应到达 */
+.diff-panel.stale .diff-body { opacity: 0.55; }
+.diff-panel.busy .diff-body { pointer-events: none; }
+
+.diff-banner {
+  background: var(--danger-bg);
+  border-color: #f3c4c4;
+  color: var(--danger);
+  padding: 10px 14px;
+  margin: 8px 0 12px;
+}
+.diff-banner ul { margin: 6px 0 0; padding-left: 20px; }
+
+.diff-empty { margin: 8px 0; color: var(--ok); font-weight: 600; }
+.diff-subhead { margin: 14px 0 6px; font-size: 13.5px; color: var(--ink); }
+.diff-list { list-style: none; margin: 0; padding: 0; }
+
+.diff-row, .invalid-row {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  padding: 9px 12px;
+  margin-bottom: 8px;
+}
+.diff-row.is-deleted { background: var(--danger-bg); border-color: #f3c4c4; }
+
+.diff-row-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+.diff-tag {
+  border-radius: 4px;
+  font-size: 11.5px;
+  padding: 1px 8px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.tag-add { background: var(--ok-bg); color: var(--ok); border-color: #b7e4c7; }
+.tag-del { background: var(--danger-bg); color: var(--danger); border-color: #f3c4c4; }
+.tag-body { background: #fff7e6; color: var(--warn); border-color: #f5d9a8; }
+.tag-move { background: var(--chip); color: var(--chip-ink); border-color: #c9d7f5; }
+.tag-ref { background: var(--danger); color: #fff; }
+
+.diff-nums { font-size: 12.5px; color: var(--muted); }
+.diff-no { font-weight: 700; color: var(--ink); }
+.diff-no.none { color: var(--muted); font-weight: 400; }
+.diff-id { font-family: ui-monospace, monospace; font-size: 11.5px; }
+
+.diff-bodies { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding-left: 2px; }
+@media (max-width: 920px) { .diff-bodies { grid-template-columns: 1fr; } }
+.diff-col-label {
+  display: block;
+  font-size: 11.5px;
+  color: var(--muted);
+  margin-bottom: 2px;
+}
+.diff-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 13px;
+  background: #fafbfc;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 9px;
+}
+.diff-text.none { color: var(--muted); background: transparent; border-style: dashed; }
+.diff-text .ref { cursor: default; }

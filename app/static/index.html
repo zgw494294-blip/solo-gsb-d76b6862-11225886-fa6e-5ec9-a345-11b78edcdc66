@@ -39,6 +39,7 @@
         </div>
         <div class="toolbar-right">
           <button id="merge-btn" disabled>合并所选</button>
+          <button id="diff-btn">对照原稿</button>
           <button id="reimport-btn">重新导入</button>
           <button id="download-btn" class="primary" disabled>下载纯文本</button>
         </div>
@@ -48,6 +49,23 @@
 
       <!-- 预览失败横幅：草稿保留、列表暂停操作，提供重试预览及取消拆分/编辑入口 -->
       <div id="preview-error-banner" class="panel banner preview-error" hidden></div>
+
+      <!-- 原稿对照：成功导入后保留不可变原稿基线，与当前已保存草稿对照 -->
+      <section id="diff-panel" class="panel diff-panel" hidden>
+        <div class="diff-head">
+          <h2>原稿对照</h2>
+          <div class="diff-status" id="diff-status"></div>
+        </div>
+        <p class="hint">
+          基线为本次成功导入时的原稿，导入后不可改变；仅列按稳定身份识别出的发生变化的条款：
+          <b>新增 / 删除 / 正文改动 / 移动</b>（标签可并存）。正文按引用绑定比较，仅显示编号变化不算改动；
+          移动只计仍存在条款间先后关系的颠倒，删除或拆分插入造成的编号平移不算移动。
+          现存条款按当前顺序排列，删除条款随后按原顺序排列。对照始终基于<b>已保存草稿</b>：
+          取消编辑或保存失败不改变对照；预览刷新失败时仍按已提交草稿对照。
+        </p>
+        <div id="diff-banner" class="banner diff-banner" hidden></div>
+        <div id="diff-body"></div>
+      </section>
 
       <div class="columns">
         <div class="panel">

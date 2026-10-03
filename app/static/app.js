@@ -26,6 +26,11 @@ const state = {
   merging: false, // /api/merge 在途（期间阻止编辑 / 删除 / 重排 / 勾选 / 重复合并）
   splitting: false, // /api/split 在途（期间阻止其他改稿）
   exporting: false, // /api/export 在途
+  baseline: null, // 成功导入后不可变的原稿基线（{ order_ids, clauses }，深拷贝）；重新导入清空
+  diffOpen: false, // 原稿对照面板是否展开
+  diffData: null, // 最近一次与当前草稿一致的 /api/diff 响应；改稿后立即置空（旧对照失效）
+  diffError: null, // 最近一次对照刷新失败的错误信息（数组）；成功一次后清空
+  diffFresh: false, // 面板内容是否已追上当前草稿；改稿立即为 false
 };
 
 const MAX_CLAUSES = 40; // 与后端 MAX_LINES 一致：拆分后总数不能超过它
@@ -33,6 +38,8 @@ const MAX_CLAUSES = 40; // 与后端 MAX_LINES 一致：拆分后总数不能超
 let previewSeq = 0; // 预览请求序号：只采用最后一次发出的预览响应
 let exportSeq = 0; // 下载请求序号：只有仍持有它的下载能收尾按钮；重新导入 / 新下载会作废旧下载的收尾权
 let previewInFlight = false; // 是否已有 /api/preview 在途：防止重试预览重复提交
+let diffSeq = 0; // 对照请求序号：只采用最后一次发出的对照响应，迟到响应不得覆盖新结果
+let diffInFlight = false; // 是否已有 /api/diff 在途：防止重复提交
 
 const MARKER = /\[\[(?:原(\d+)\?|(\d+))\]\]/g; // 预览文本中的引用形态
 
@@ -49,6 +56,11 @@ const brokenBanner = $("#broken-banner");
 const previewErrorBanner = $("#preview-error-banner");
 const downloadBtn = $("#download-btn");
 const mergeBtn = $("#merge-btn");
+const diffBtn = $("#diff-btn");
+const diffPanel = $("#diff-panel");
+const diffStatus = $("#diff-status");
+const diffBanner = $("#diff-banner");
+const diffBody = $("#diff-body");
 const statCount = $("#stat-count");
 const statBroken = $("#stat-broken");
 
@@ -108,6 +120,15 @@ function snapshot() {
   };
 }
 
+// 原稿基线：成功导入那一刻的草稿快照。基线一经建立不再随改稿变动，
+// 因此这里返回深拷贝，避免后续编辑、合并、拆分误写基线。
+function snapshotBaseline() {
+  return {
+    order_ids: state.baseline.order_ids.slice(),
+    clauses: state.baseline.clauses.map((c) => ({ id: c.id, body: c.body })),
+  };
+}
+
 // --------------------------------------------------------------------------- //
 // 草稿改动与工具栏状态
 // --------------------------------------------------------------------------- //
@@ -116,7 +137,13 @@ function snapshot() {
 function touch() {
   state.rev += 1;
   state.previewFresh = false;
+  // 改稿后旧对照立即失效：已展示的对照内容立即标记过期，等待新草稿的对照响应；
+  // 取消编辑 / 保存失败不经过 touch()，因此不会让对照失效。
+  state.diffFresh = false;
+  state.diffData = null;
   syncToolbar();
+  syncDiffPanel();
+  if (state.diffOpen) refreshDiff(); // 面板展开时按最新已提交草稿重新对照
 }
 
 function syncToolbar() {
@@ -239,6 +266,17 @@ importBtn.addEventListener("click", async () => {
     state.splitRefsTo = "front";
     state.splitting = false;
     state.idCounter = data.clauses.length; // 导入身份为 c1..cN，拆分新身份从 N+1 起
+    // 成功导入建立不可变原稿基线（深拷贝），同时收起并清空旧对照
+    state.baseline = {
+      order_ids: state.orderIds.slice(),
+      clauses: state.clauses.map((c) => ({ id: c.id, body: c.body })),
+    };
+    state.diffOpen = false;
+    state.diffData = null;
+    state.diffError = null;
+    state.diffFresh = false;
+    diffSeq += 1;
+    diffInFlight = false;
     state.preview = null;
     state.previewError = null;
     state.renderedRev = null;
@@ -250,6 +288,8 @@ importBtn.addEventListener("click", async () => {
     importErrors.hidden = true;
     importPanel.hidden = true;
     desk.hidden = false;
+    diffPanel.hidden = true;
+    diffBtn.textContent = "对照原稿";
     render();
   } catch (e) {
     importErrors.innerHTML = errorList(e).map((m) => `<li>${esc(m)}</li>`).join("");
@@ -274,6 +314,13 @@ $("#reimport-btn").addEventListener("click", () => {
   state.splitOffset = null;
   state.splitRefsTo = "front";
   state.idCounter = 0;
+  state.baseline = null; // 重新导入清空原稿基线，成功导入后再建立
+  state.diffOpen = false;
+  state.diffData = null;
+  state.diffError = null;
+  state.diffFresh = false;
+  diffSeq += 1; // 上一草稿的迟到对照响应一律丢弃
+  diffInFlight = false;
   state.preview = null;
   state.previewError = null;
   state.renderedRev = null;
@@ -289,6 +336,8 @@ $("#reimport-btn").addEventListener("click", () => {
   previewInFlight = false; // 上一草稿在途预览的收尾将因世代不符而直接返回，这里复位在途态
   desk.hidden = true;
   importPanel.hidden = false;
+  diffPanel.hidden = true;
+  diffBtn.textContent = "对照原稿";
   syncPreviewErrorBanner();
   syncToolbar();
 });
@@ -1015,6 +1064,225 @@ function moveClause(srcId, targetId, after) {
   touch();
   render();
 }
+
+// --------------------------------------------------------------------------- //
+// 原稿对照（与预览相互独立：成功导入后保留不可变基线，对照当前已保存草稿）
+// --------------------------------------------------------------------------- //
+const DIFF_TAGS = {
+  added: { label: "新增", cls: "tag-add" },
+  deleted: { label: "删除", cls: "tag-del" },
+  body_changed: { label: "正文改动", cls: "tag-body" },
+  moved: { label: "移动", cls: "tag-move" },
+};
+
+// 把已解析正文（[[n]] 或 [[原X?]]）渲染为带标记样式的 HTML；引用在对照中不可点击
+function diffTextHtml(text) {
+  let html = "";
+  let last = 0;
+  for (const m of text.matchAll(MARKER)) {
+    html += esc(text.slice(last, m.index));
+    if (m[1] !== undefined) {
+      html += `<span class="ref dead">[[原${m[1]}?]]</span>`;
+    } else {
+      html += `<span class="ref">[[${m[2]}]]</span>`;
+    }
+    last = m.index + m[0].length;
+  }
+  html += esc(text.slice(last));
+  return html;
+}
+
+function tagHtml(tags) {
+  return tags
+    .map((t) => {
+      const meta = DIFF_TAGS[t] || { label: t, cls: "" };
+      return `<span class="diff-tag ${meta.cls}">${meta.label}</span>`;
+    })
+    .join("");
+}
+
+function numCell(no, text) {
+  return no === null || no === undefined ? `<span class="diff-no none">${text}</span>` : `<span class="diff-no">${no}</span>`;
+}
+
+function diffItemHtml(item) {
+  const isDelete = item.tags.includes("deleted");
+  const isAdd = item.tags.includes("added");
+  const baseBody =
+    item.baseline_text === null || item.baseline_text === undefined
+      ? `<div class="diff-text none">（原稿无此条款）</div>`
+      : `<div class="diff-text">${diffTextHtml(item.baseline_text)}</div>`;
+  const curBody =
+    item.current_text === null || item.current_text === undefined
+      ? `<div class="diff-text none">（现已删除）</div>`
+      : `<div class="diff-text">${diffTextHtml(item.current_text)}</div>`;
+  return `
+    <li class="diff-row ${isDelete ? "is-deleted" : ""}">
+      <div class="diff-row-head">
+        ${tagHtml(item.tags)}
+        <span class="diff-nums">
+          原编号 ${numCell(item.baseline_no, "—")}
+          → 现编号 ${numCell(item.current_no, "—")}
+          <span class="diff-id">（稳定身份 ${esc(item.id)}）</span>
+        </span>
+      </div>
+      ${isAdd || isDelete ? "" : `<div class="diff-bodies">`}
+      ${
+        isAdd
+          ? `<div class="diff-col"><span class="diff-col-label">现稿正文</span>${curBody}</div>`
+          : isDelete
+            ? `<div class="diff-col"><span class="diff-col-label">原稿正文</span>${baseBody}</div>`
+            : `<div class="diff-col"><span class="diff-col-label">原稿正文（原第 ${item.baseline_no} 条）</span>${baseBody}</div>
+               <div class="diff-col"><span class="diff-col-label">现稿正文（现第 ${item.current_no} 条）</span>${curBody}</div>`
+      }
+      ${isAdd || isDelete ? "" : `</div>`}
+    </li>`;
+}
+
+// 正文未变、但某条引用由基线有效变为现稿失效：另列来源及位置
+function invalidRefHtml(rec) {
+  return `
+    <li class="invalid-row">
+      <div class="diff-row-head">
+        <span class="diff-tag tag-ref">引用失效</span>
+        <span class="diff-nums">
+          来源：原编号 ${numCell(rec.baseline_no)} → 现编号 ${numCell(rec.current_no)}
+          <span class="diff-id">（稳定身份 ${esc(rec.source_id)}）</span>
+          · 失效引用 <span class="ref dead">[[原${rec.ref_original}?]]</span>
+          （原第 ${rec.ref_original} 条已删除；正文第 ${rec.position}～${rec.position_end} 个字符处）
+        </span>
+      </div>
+      <div class="diff-bodies">
+        <div class="diff-col"><span class="diff-col-label">原稿正文</span><div class="diff-text">${diffTextHtml(rec.baseline_text)}</div></div>
+        <div class="diff-col"><span class="diff-col-label">现稿正文（正文未变，引用已失效）</span><div class="diff-text">${diffTextHtml(rec.current_text)}</div></div>
+      </div>
+    </li>`;
+}
+
+// 渲染对照面板。改稿后旧对照立即失效：在新草稿的对照响应到达前，
+// 保留旧内容仅用于“已失效”提示（置灰），绝不用迟到响应覆盖新结果。
+function renderDiff() {
+  const stale = !state.diffFresh;
+  diffPanel.classList.toggle("stale", stale);
+  diffPanel.classList.toggle("busy", stale && diffInFlight);
+
+  if (state.diffError) {
+    diffStatus.textContent = "";
+    diffBanner.hidden = false;
+    diffBanner.innerHTML =
+      `<strong>对照刷新失败。</strong>仍显示上次已提交草稿的对照结果（如有），草稿未改动。` +
+      `<ul>${state.diffError.map((m) => `<li>${esc(m)}</li>`).join("")}</ul>` +
+      `<div class="preview-error-actions"><button type="button" class="primary" data-action="diff-retry"${
+        diffInFlight ? " disabled" : ""
+      }>${diffInFlight ? "重试中…" : "重试对照"}</button></div>`;
+  } else {
+    diffBanner.hidden = true;
+    diffBanner.textContent = "";
+  }
+
+  const data = state.diffData;
+  if (!data || !Array.isArray(data.items) || !Array.isArray(data.invalid_refs)) {
+    diffStatus.textContent = diffInFlight ? "对照中…" : stale ? "旧对照已失效，正在按最新草稿重新对照…" : "";
+    diffBody.textContent = "";
+    return;
+  }
+
+  const parts = [];
+  if (!data.items.length && !data.invalid_refs.length) {
+    parts.push('<p class="diff-empty">无变更</p>');
+  } else {
+    if (data.items.length) {
+      parts.push(
+        `<ul class="diff-list">${data.items.map(diffItemHtml).join("")}</ul>`,
+      );
+    } else {
+      parts.push('<p class="diff-empty">无变更</p>');
+    }
+    if (data.invalid_refs.length) {
+      parts.push(
+        `<h3 class="diff-subhead">正文未变但引用由有效变失效（${data.invalid_refs.length} 处）</h3>` +
+          `<ul class="diff-list invalid-list">${data.invalid_refs.map(invalidRefHtml).join("")}</ul>`,
+      );
+    }
+  }
+  diffStatus.textContent = stale
+    ? diffInFlight
+      ? "旧对照已失效，正在重新对照…"
+      : "旧对照已失效"
+    : "已与当前草稿一致";
+  diffStatus.classList.toggle("is-stale", stale);
+  diffStatus.classList.toggle("is-fresh", !stale);
+  diffBody.innerHTML = parts.join("");
+}
+
+function syncDiffPanel() {
+  if (!state.diffOpen) return;
+  diffPanel.hidden = false;
+  diffBtn.textContent = "收起对照";
+  renderDiff();
+}
+
+// 按当前已保存草稿向 /api/diff 请求对照；预览成功与否互不影响。
+// 只有最后一次发出、且仍对应当前草稿的响应才会被采用。
+async function refreshDiff() {
+  if (!state.baseline) return;
+  const seq = ++diffSeq;
+  const rev = state.rev;
+  diffInFlight = true;
+  renderDiff();
+  let data;
+  try {
+    data = await api("/api/diff", { baseline: snapshotBaseline(), current: snapshot() });
+  } catch (e) {
+    // 迟到响应（草稿已再改动 / 已重新导入 / 被更新请求取代）不得覆盖新结果，
+    // 也不得清掉最新请求的在途标记；在途标记只由最新请求收尾
+    if (seq !== diffSeq || rev !== state.rev) return;
+    // 预览刷新失败仍按已提交草稿对照：对照失败时保留旧结果并给出重试入口，
+    // 不锁定列表、不影响下载等既有操作
+    diffInFlight = false;
+    state.diffError = errorList(e);
+    renderDiff();
+    return;
+  }
+  // 改稿后旧对照立即失效：迟到响应不得覆盖新结果；在途标记同样只由最新者清
+  if (seq !== diffSeq || rev !== state.rev) return;
+  diffInFlight = false;
+  if (
+    !data ||
+    !Array.isArray(data.items) ||
+    !Array.isArray(data.invalid_refs)
+  ) {
+    state.diffError = ["对照响应正文不完整，请重试。"];
+    renderDiff();
+    return;
+  }
+  state.diffData = data;
+  state.diffError = null;
+  state.diffFresh = true;
+  renderDiff();
+}
+
+diffBtn.addEventListener("click", () => {
+  if (!state.baseline) return;
+  state.diffOpen = !state.diffOpen;
+  diffPanel.hidden = !state.diffOpen;
+  diffBtn.textContent = state.diffOpen ? "收起对照" : "对照原稿";
+  if (state.diffOpen) {
+    // 打开时若尚未追上当前草稿（首次打开或改稿后），按已提交草稿发起对照；
+    // 已有一致结果则直接展示，不重复请求
+    if (!state.diffFresh) refreshDiff();
+    else renderDiff();
+  } else {
+    diffSeq += 1; // 收起后在途响应回来也不再采用
+  }
+});
+
+// 对照失败横幅上的重试入口
+diffBanner.addEventListener("click", (ev) => {
+  const btn = ev.target.closest('[data-action="diff-retry"]');
+  if (!btn || diffInFlight) return;
+  refreshDiff();
+});
 
 // --------------------------------------------------------------------------- //
 // 下载（以服务端 /api/export 为准，保证与预览一致）

@@ -532,3 +532,221 @@ def test_split_then_merge_and_merge_then_split():
     assert by["c1"] == "甲方在七日内交付设备；"
     # 后段中指向被拆条款（前段）的引用保持绑定
     assert by["c6"] == "乙方按 [[c1]] 验收后付款"
+
+
+# --------------------------------------------------------------------------- #
+# 原稿对照 /api/diff
+# --------------------------------------------------------------------------- #
+def _state(doc, order=None):
+    return {
+        "order_ids": order or [c["id"] for c in doc["clauses"]],
+        "clauses": [{"id": c["id"], "body": c["body"]} for c in doc["clauses"]],
+    }
+
+
+def _diff(baseline, current):
+    return client.post("/api/diff", json={"baseline": baseline, "current": current})
+
+
+def test_diff_no_changes():
+    doc = import_text(GOOD).json()
+    base = _state(doc)
+    r = _diff(base, base)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["has_changes"] is False
+    assert data["items"] == []
+    assert data["invalid_refs"] == []
+
+
+def test_diff_reorder_marks_moved_and_tolerates_display_number_change():
+    doc = import_text(GOOD).json()
+    base = _state(doc)
+    # 仅重排（c4 提到首位）：全部条款相对原稿颠倒，标 moved；
+    # 正文内部绑定未变，仅显示编号变化，不标 body_changed
+    cur = _state(doc, ["c4", "c1", "c2", "c3"])
+    data = _diff(base, cur).json()
+    by = {it["id"]: it for it in data["items"]}
+    assert set(by) == {"c1", "c2", "c3", "c4"}
+    for item in by.values():
+        assert item["tags"] == ["moved"]
+    assert by["c4"]["baseline_no"] == 4 and by["c4"]["current_no"] == 1
+    # 两版正文按各自编号解析：绑定同一条款，显示编号不同
+    assert by["c2"]["baseline_text"] == "乙方按 [[1]] 验收后付款"
+    assert by["c2"]["current_text"] == "乙方按 [[2]] 验收后付款"
+    assert data["invalid_refs"] == []
+
+
+def test_diff_adjacent_swap_marks_both_participants():
+    doc = import_text(GOOD).json()
+    base = _state(doc)
+    data = _diff(base, _state(doc, ["c2", "c1", "c3", "c4"])).json()
+    by = {it["id"]: it for it in data["items"]}
+    assert by["c1"]["tags"] == ["moved"]
+    assert by["c2"]["tags"] == ["moved"]
+    assert "c3" not in by and "c4" not in by  # 未参与颠倒的条款不出现
+
+
+def test_diff_delete_shifts_numbers_but_is_not_move_and_lists_broken_ref_source():
+    doc = import_text(GOOD).json()
+    base = _state(doc)
+    # 删除 c2：c1/c3/c4 编号平移但相对先后不变，不算移动；c3 中 [[c2]] 由有效变失效
+    cur = {
+        "order_ids": ["c1", "c3", "c4"],
+        "clauses": [b for b in base["clauses"] if b["id"] != "c2"],
+    }
+    data = _diff(base, cur).json()
+    assert [(it["id"], it["tags"]) for it in data["items"]] == [("c2", ["deleted"])]
+    deleted = data["items"][0]
+    assert deleted["baseline_no"] == 2 and deleted["current_no"] is None
+    assert deleted["baseline_text"] == "乙方按 [[1]] 验收后付款"
+    assert deleted["current_text"] is None
+    # 现存项按当前顺序在前，删除项在最后：此处仅删除项
+    assert len(data["invalid_refs"]) == 1
+    rec = data["invalid_refs"][0]
+    assert rec["source_id"] == "c3"
+    assert rec["ref_id"] == "c2" and rec["ref_original"] == 2
+    assert rec["baseline_no"] == 3 and rec["current_no"] == 2
+    assert rec["position"] == 19 and rec["position_end"] == 25  # 1 起、按 Unicode 码位
+    assert rec["baseline_text"] == "争议解决见 [[4]]，违约参照 [[2]]"
+    # c4 仍存在（现处第 3 位），[[c4]] 仅显示编号变为 [[3]]；只有被删的 c2 变失效
+    assert rec["current_text"] == "争议解决见 [[3]]，违约参照 [[原2?]]"
+    assert data["has_changes"] is True
+
+
+def test_diff_split_is_front_body_change_and_back_added_without_move():
+    doc = import_text(GOOD).json()
+    base = _state(doc)
+    r = client.post(
+        "/api/split",
+        json={**base, "split_id": "c2", "offset": 2, "new_id": "c5", "refs_to": "front"},
+    )
+    cur = {"order_ids": r.json()["order_ids"], "clauses": r.json()["clauses"]}
+    data = _diff(base, cur).json()
+    # 顺序：现存项（c2 改动、c5 新增）按当前顺序；插入造成的平移不算移动
+    assert [(it["id"], it["tags"]) for it in data["items"]] == [
+        ("c2", ["body_changed"]),
+        ("c5", ["added"]),
+    ]
+    c2 = next(it for it in data["items"] if it["id"] == "c2")
+    assert c2["baseline_text"] == "乙方按 [[1]] 验收后付款"
+    assert c2["current_text"] == "乙方"
+    c5 = next(it for it in data["items"] if it["id"] == "c5")
+    assert c5["baseline_no"] is None and c5["current_no"] == 3
+    assert c5["baseline_text"] is None
+    assert c5["current_text"] == "按 [[1]] 验收后付款"
+    assert data["invalid_refs"] == []
+
+
+def test_diff_merge_is_kept_body_change_and_drop_deleted():
+    doc = import_text(GOOD).json()
+    base = _state(doc)
+    r = client.post(
+        "/api/merge",
+        json={**base, "keep_id": "c1", "drop_id": "c2"},
+    )
+    cur = {"order_ids": r.json()["order_ids"], "clauses": r.json()["clauses"]}
+    data = _diff(base, cur).json()
+    # 现存项按当前顺序（c1 改动、c3 因引用重写而改动），删除项 c2 在最后
+    assert [(it["id"], it["tags"]) for it in data["items"]] == [
+        ("c1", ["body_changed"]),
+        ("c3", ["body_changed"]),
+        ("c2", ["deleted"]),
+    ]
+    c1 = next(it for it in data["items"] if it["id"] == "c1")
+    assert c1["baseline_text"] == "甲方在七日内交付设备"
+    assert c1["current_text"] == "甲方在七日内交付设备；乙方按 [[1]] 验收后付款"
+
+
+def test_diff_body_change_and_move_tags_coexist():
+    doc = import_text(GOOD).json()
+    base = _state(doc)
+    bodies = [dict(b) for b in base["clauses"]]
+    bodies[0]["body"] = "甲方改为三十日内交付设备"
+    cur = {"order_ids": ["c2", "c3", "c4", "c1"], "clauses": bodies}
+    data = _diff(base, cur).json()
+    c1 = next(it for it in data["items"] if it["id"] == "c1")
+    assert set(c1["tags"]) == {"body_changed", "moved"}
+
+
+def test_diff_edit_body_change_is_comparison_by_ref_binding():
+    doc = import_text(GOOD).json()
+    base = _state(doc)
+    # 顺序改变、c3 正文内部绑定完全一致（只是显示编号变了）：不标 body_changed
+    reordered = _state(doc, ["c4", "c1", "c2", "c3"])
+    data = _diff(base, reordered).json()
+    c3 = next(it for it in data["items"] if it["id"] == "c3")
+    assert "body_changed" not in c3["tags"]
+    # 真正改正文（内部绑定变化）才标 body_changed
+    bodies = [dict(b) for b in base["clauses"]]
+    bodies[2]["body"] = "争议解决改为 [[c1]]"
+    data = _diff(base, {"order_ids": base["order_ids"], "clauses": bodies}).json()
+    c3 = next(it for it in data["items"] if it["id"] == "c3")
+    assert c3["tags"] == ["body_changed"]
+    assert c3["current_text"] == "争议解决改为 [[1]]"
+
+
+def test_diff_invalid_ref_only_listed_when_body_unchanged():
+    doc = import_text(GOOD).json()
+    base = _state(doc)
+    # 删 c4 后又编辑 c3 修复引用：正文已变，标 body_changed，不再列入引用失效
+    after_delete = {
+        "order_ids": ["c1", "c2", "c3"],
+        "clauses": [b for b in base["clauses"] if b["id"] != "c4"],
+    }
+    r = client.post(
+        "/api/save",
+        json={**after_delete, "edit_id": "c3", "text": "争议解决改为 [[1]]"},
+    )
+    fixed = [
+        {"id": b["id"], "body": r.json()["body"] if b["id"] == "c3" else b["body"]}
+        for b in after_delete["clauses"]
+    ]
+    data = _diff(base, {"order_ids": after_delete["order_ids"], "clauses": fixed}).json()
+    c3 = next(it for it in data["items"] if it["id"] == "c3")
+    assert c3["tags"] == ["body_changed"]
+    assert data["invalid_refs"] == []
+
+
+def test_diff_already_broken_in_baseline_is_not_relisted():
+    doc = import_text(GOOD).json()
+    base_full = _state(doc)
+    # 基线本身就是删除 c4 后的状态（c3 含失效引用）：现稿相同，应“无变更”
+    broken = {
+        "order_ids": ["c1", "c2", "c3"],
+        "clauses": [b for b in base_full["clauses"] if b["id"] != "c4"],
+    }
+    data = _diff(broken, broken).json()
+    assert data["has_changes"] is False
+    assert data["items"] == [] and data["invalid_refs"] == []
+
+
+def test_diff_validates_both_documents():
+    doc = import_text(GOOD).json()
+    base = _state(doc)
+    # 基线损坏：顺序列表与条款集合不一致 → 422
+    r = _diff({"order_ids": ["c1"], "clauses": base["clauses"]}, base)
+    assert r.status_code == 422
+    # 现稿损坏：内部引用形态损坏 → 422
+    bad_cur = {
+        "order_ids": base["order_ids"],
+        "clauses": [
+            {"id": b["id"], "body": b["body"].replace("[[c1]]", "[[1]]") if b["id"] == "c2" else b["body"]}
+            for b in base["clauses"]
+        ],
+    }
+    r = _diff(base, bad_cur)
+    assert r.status_code == 422
+
+
+def test_diff_does_not_modify_input_documents():
+    doc = import_text(GOOD).json()
+    base = _state(doc)
+    cur = _state(doc, ["c4", "c1", "c2", "c3"])
+    import copy
+    payload = {"baseline": copy.deepcopy(base), "current": copy.deepcopy(cur)}
+    r = client.post("/api/diff", json=payload)
+    assert r.status_code == 200
+    # 接口只返回对照，不回退任何草稿
+    assert payload["baseline"] == base
+    assert payload["current"] == cur
